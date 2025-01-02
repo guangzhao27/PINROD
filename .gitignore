@@ -2,3 +2,4 @@
 *.pt
 results/
 outputs/
+*.out

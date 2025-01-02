@@ -1,10 +1,12 @@
 #!/bin/bash
 
-w0_list=(20 30)
+w0_list=(20)
 latent_list=(256)
 cd /pscratch/sd/g/gzhao27/INR/SOMA/script/
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate coral
+
+# {'w0': 72, 'lr': 3.6877341984833775e-05, 'inr-depth': 6, 'inr-hidden-dim': 53}
 
 epochs=4000
 dataset=$1
@@ -17,9 +19,10 @@ if [ "$dataset" == "soma" ]; then
         do
         for k in "${!latent_list[@]}"; do
             if [ "$task_type" == "test" ]; then
-                bash nersc-soma-inr-w0-low-dim.sh ${w0_list[i]} 20 ${latent_list[k]}
+                bash nersc-soma-inr-w0.sh ${w0_list[i]} 20 ${latent_list[k]}
+                break
             else
-                sbatch nersc-soma-inr-w0-low-dim.sh ${w0_list[i]} ${epochs} ${latent_list[k]} 
+                sbatch nersc-soma-inr-w0.sh ${w0_list[i]} ${epochs} ${latent_list[k]} 
                 echo soma
                 echo ${j} ${w0_list[i]} ${latent_list[k]}
             fi

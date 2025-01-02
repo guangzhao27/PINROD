@@ -41,9 +41,9 @@ def test_soma():
         data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5',
         train_num=10, 
         feature_set=[10],
-        space_factor=4,
-        time_factor=2, 
-        latent_dim=180,
+        space_factor=1,
+        time_factor=1, 
+        latent_dim=256,
     )
     feat_ori = trainset[0].feat
     

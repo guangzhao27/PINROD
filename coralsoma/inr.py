@@ -30,14 +30,32 @@ from coral.utils.models.load_inr import create_inr_instance
 from coral.utils.plot import show
 from datetime import datetime
 from time import time
+from torch_geometric.data import Data
 
 
 
 os.environ["WANDB_DIR"] = '/pscratch/sd/g/gzhao27/INR/coral/wandb'
 os.environ["RESULTS_DIR"] = ''
 
+
+def divide_array_indexes(N, k):
+    # Base size and extra elements
+    base_size = N // k
+    extra = N % k
+    
+    # Create the index ranges
+    indexes = []
+    start = 0
+    for i in range(k):
+        end = start + base_size + (1 if i < extra else 0)
+        indexes.append(torch.tensor(list(range(start, end))))
+        start = end
+    
+    return indexes
+
 @hydra.main(config_path="../config/", config_name="siren.yaml")
 def main(cfg: DictConfig) -> None:
+    print(OmegaConf.to_yaml(cfg))
 
     # neceassary for some reason now
     torch.set_default_dtype(torch.float32)
@@ -74,7 +92,7 @@ def main(cfg: DictConfig) -> None:
     seq_inter_len = cfg.data.seq_inter_len
     seq_extra_len = cfg.data.seq_extra_len
     missing_rate = cfg.data.missing_rate
-    sub_array_num = 5
+    sub_array_num = cfg.data.sub_array_num
 
     # optim
     batch_size = cfg.optim.batch_size
@@ -189,45 +207,7 @@ def main(cfg: DictConfig) -> None:
         input_dim = 1
         output_dim = 1
         trainset, valset, testset, p_mean, p_std = create_burgers_dataset()
-        # input_dim = 1
-        # output_dim = 1
-        # trainnum = 1000
-        # valnum = 100
-        # testnum = 100
-        # train_p_list=(0.001, 0.004, 0.02)
-        # val_p_list = (0.01, )
-        # test_p_list = (0.02, )
-        # path_format = "/pscratch/sd/g/gzhao27/INR/data/1D_Burgers_Sols_Nu{}.hdf5"
-        # def create_dict(p_list, start, Dnum):
-        #     Ddict = {}
-        #     for p in p_list:
-        #         temppath = path_format.format(p)
-        #         Ddict[temppath] = (list(range(start, start+Dnum)), p)
-        #     return Ddict
-        
-        # traindict = create_dict(train_p_list, 0, trainnum)
-        # valdict = create_dict(val_p_list, trainnum, valnum)
-        # testdict = create_dict(test_p_list, trainnum+valnum, testnum)
-        
-        # trainset = GraphBurgers(
-        #     datapath_dict=traindict,
-        #     latent_dim=128,
-        #     missing_rate=0.5,
-        # )
-        # valset = GraphBurgers(
-        #     datapath_dict=valdict,
-        #     latent_dim=128,
-        #     missing_rate=0.,
-        # )
-        # testset = GraphBurgers(
-        #     datapath_dict=testdict,
-        #     latent_dim=128,
-        #     missing_rate=0.
-        # )
-        
-        
-            
-        # trainset, valset, testset = create_dataset(train_num=100, val_num=100, train_p_list=(0.001, 0.004, 0.02), val_p_list=(0.01,))
+          
     else:
         raise NotImplementedError(f"The dataset ${dataset_name} does not have a corresponding class.")
 
@@ -244,74 +224,7 @@ def main(cfg: DictConfig) -> None:
     print("train", len(trainset))
     print("val", len(valset))
 
-    # cfg.inr = cfg.inr_in
-    # inr_in = create_inr_instance(
-    #     cfg, input_dim=input_dim, output_dim=output_dim, device="cuda"
-    # )
 
-    # alpha_in = nn.Parameter(torch.Tensor([lr_code]).cuda())
-
-    # (u_train, u_eval_extrapolation, u_test, grid_tr, grid_tr_extra, grid_te) = get_dynamics_data(
-    #     data_dir,
-    #     dataset_name,
-    #     ntrain,
-    #     ntest,
-    #     seq_inter_len=seq_inter_len,
-    #     seq_extra_len=seq_extra_len,
-    #     sub_from=sub_from,
-    #     space_factor=space_factor,
-    #     time_factor=time_factor,
-    #     same_grid=same_grid,
-    # )
-    # print(f"data: {dataset_name}, u_train: {u_train.shape}, u_eval_extrapolation: {u_eval_extrapolation.shape}, u_test: {u_test.shape}")
-    # print(f"grid: grid_tr: {grid_tr.shape}, grid_tr_extra: {grid_tr_extra.shape}, grid_te: {grid_te.shape}")
-    # print("same_grid : ", same_grid)
-    # if data_to_encode == None:
-    #     run.tags = ("inr",) + (model_type,) + (dataset_name,) + (f"sub={space_factor}",)
-    # else:
-    #     run.tags = (
-    #         ("inr",)
-    #         + (model_type,)
-    #         + (dataset_name,)
-    #         + (f"sub={space_factor}",)
-    #         + (data_to_encode,)
-    #     )
-
-    # trainset = TemporalDatasetWithCode(
-    #     u_train, grid_tr, latent_dim, dataset_name, data_to_encode
-    # )
-    # testset = TemporalDatasetWithCode(
-    #     u_test, grid_te, latent_dim, dataset_name, data_to_encode
-    # )
-
-    # # trainset coords of shape (N, Dx, Dy, input_dim, T)
-    # input_dim = trainset.input_dim
-    # # trainset images of shape (N, Dx, Dy, output_dim, T)
-    # output_dim = trainset.output_dim
-
-    # # transforms datasets shape into (N * T, Dx, Dy, C)
-    # trainset = rearrange(trainset, dataset_name)
-    # testset = rearrange(testset, dataset_name)
-
-    # #total frames trainset
-    # ntrain = trainset.z.shape[0]
-    # #total frames testset
-    # ntest = testset.z.shape[0]
-
-    # # create torch dataset
-    # train_loader = torch.utils.data.DataLoader(
-    #     trainset,
-    #     batch_size=batch_size,
-    #     shuffle=True,
-    #     num_workers=1,
-    #     pin_memory=True,
-    # )
-    # test_loader = torch.utils.data.DataLoader(
-    #     testset,
-    #     batch_size=batch_size_val,
-    #     shuffle=True,
-    #     num_workers=1,
-    # ) 
 
     inr = create_inr_instance(
         cfg, input_dim=input_dim, output_dim=output_dim, device=device
@@ -369,127 +282,204 @@ def main(cfg: DictConfig) -> None:
         step_show_last = step == epochs - 1
         start = time()
         for substep, graph in enumerate(train_loader):
+            
             # torch.cuda.empty_cache()
             inr.train()
-            
-            
-            n_samples = len(graph)
+            if sub_array_num>1:
+                graph_T = graph.time[-1]+1
+                time_indexes = divide_array_indexes(graph_T, sub_array_num)
+                print('time1:', time()-start)
+                start = time()
+                
+                for tidx in time_indexes:
+                    n_samples = len(tidx)
+                    graph0 = Data()
+                    booltensor = torch.isin(graph.time, tidx)
+                    graph0.images = graph.feat[booltensor].to(device)
+                    graph0.pos = graph.space_emb[booltensor].to(device)
+                    graph0.batch = graph.time[booltensor].to(device)
+                    graph0.modulations = graph.latent_vector.to(device)
+                    
+                    print('time2', time()-start)
+                    start = time()
+                    
+                    outputs = outer_step(
+                        inr,
+                        graph0,
+                        inner_steps,
+                        alpha,
+                        is_train=True,
+                        return_reconstructions=False,
+                        gradient_checkpointing=True,
+                        use_rel_loss=use_rel_loss,
+                        loss_type="mse",
+                    )
+                    print('time3', time()-start)
+                    start = time()
+                    
+                    print('memory:', torch.cuda.memory_allocated()/1024**3)
+                    optimizer.zero_grad()
+                    outputs["loss"].backward(create_graph=False)
+                    
+                    nn.utils.clip_grad_value_(inr.parameters(), clip_value=1.0)
+                    print('time4', time()-start)
+                    start = time()
+                    optimizer.step()
+                    loss = outputs["loss"].cpu().detach()
+                    fit_train_mse += loss.item() * n_samples / graph_T.item()
+                    
+                    if use_rel_loss:
+                        rel_train_mse += outputs["rel_loss"].item() * n_samples / graph_T.item()
+                    print('time5', time()-start)
+                    start = time()
+                    
+            else:
+                n_samples = len(graph)
 
-            #modify for outer_step function
-            graph.images = graph.feat.to(device)
-            graph.pos = graph.space_emb.to(device)
-            graph.batch = graph.time.to(device)
-            graph.modulations = graph.latent_vector.to(device) #torch.zeros_like(graph.latent_vector)
-            # graph.to(device)
-            
-            outputs = outer_step(
-                inr,
-                graph,
-                inner_steps,
-                alpha,
-                is_train=True,
-                return_reconstructions=False,
-                gradient_checkpointing=False,
-                use_rel_loss=use_rel_loss,
-                loss_type="mse",
-            )
-            
-            optimizer.zero_grad()
-            outputs["loss"].backward(create_graph=False)
-            nn.utils.clip_grad_value_(inr.parameters(), clip_value=1.0)
-            optimizer.step()
-            loss = outputs["loss"].cpu().detach()
-            fit_train_mse += loss.item() * n_samples
-            
-            if use_rel_loss:
-                rel_train_mse += outputs["rel_loss"].item() * n_samples
-            
-            z0 = outputs["modulations"].detach()
+                #modify for outer_step function
+                graph.images = graph.feat.to(device)
+                graph.pos = graph.space_emb.to(device)
+                graph.batch = graph.time.to(device)
+                graph.modulations = graph.latent_vector.to(device) #torch.zeros_like(graph.latent_vector)
+                # graph.to(device)
+                
+                outputs = outer_step(
+                    inr,
+                    graph,
+                    inner_steps,
+                    alpha,
+                    is_train=True,
+                    return_reconstructions=False,
+                    gradient_checkpointing=False,
+                    use_rel_loss=use_rel_loss,
+                    loss_type="mse",
+                )
+                
+                optimizer.zero_grad()
+                outputs["loss"].backward(create_graph=False)
+                nn.utils.clip_grad_value_(inr.parameters(), clip_value=1.0)
+                optimizer.step()
+                loss = outputs["loss"].cpu().detach()
+                fit_train_mse += loss.item() * n_samples
+                
+                if use_rel_loss:
+                    rel_train_mse += outputs["rel_loss"].item() * n_samples
             
         train_loss = fit_train_mse / (ntrain)
         
         
-        print('time:', time()-start)
         if use_rel_loss:
             rel_train_loss = rel_train_mse / ntrain
-            
+        print('time:', time()-start)
         print('train loss')
         print(train_loss)
 
         if True in (step_show, step_show_last):
             for substep, graph in enumerate(val_loader):
                 inr.eval()
-                n_samples = len(graph)
                 
-                graph.images = graph.feat.to(device)
-                graph.pos = graph.space_emb.to(device)
-                graph.batch = graph.time.to(device)
-                graph.modulations = graph.latent_vector.to(device) #torch.zeros_like(graph.latent_vector)
-                # graph.modulations = torch.zeros_like(graph.latent_vector)
-                # graph.to(device)
+                if sub_array_num>1:
+                    graph_T = graph.time[-1]+1
+                    time_indexes = divide_array_indexes(graph_T, sub_array_num)
+                    
+                    for tidx in time_indexes:
+                        n_samples = len(tidx)
+                        graph0 = Data()
+                        booltensor = torch.isin(graph.time, tidx)
+                        graph0.images = graph.feat[booltensor].to(device)
+                        graph0.pos = graph.space_emb[booltensor].to(device)
+                        graph0.batch = graph.time[booltensor].to(device)
+                        graph0.modulations = graph.latent_vector.to(device)
+                        
+                        outputs = outer_step(
+                            inr, 
+                            graph0, 
+                            inner_steps, 
+                            alpha, 
+                            is_train=False, 
+                            return_reconstructions=False, 
+                            use_rel_loss=use_rel_loss,
+                            loss_type="mse",
+                        )
+                        
+                        loss = outputs['loss']
+                        fit_test_mse += loss.item() * n_samples/graph_T.item()
+                        
+                        if use_rel_loss:
+                            rel_test_mse += outputs['rel_loss'].item() * n_samples/graph_T.item()
+                else:
+                    n_samples = len(graph)
+                    
+                    
+                    
+                    graph.images = graph.feat.to(device)
+                    graph.pos = graph.space_emb.to(device)
+                    graph.batch = graph.time.to(device)
+                    graph.modulations = graph.latent_vector.to(device) #torch.zeros_like(graph.latent_vector)
+                    # graph.modulations = torch.zeros_like(graph.latent_vector)
+                    # graph.to(device)
 
-                outputs = outer_step(
-                    inr,
-                    graph,
-                    inner_steps,
-                    alpha,
-                    is_train=False,
-                    return_reconstructions=False,
-                    gradient_checkpointing=False,
-                    use_rel_loss=use_rel_loss,
-                    loss_type="mse",
-                )
+                    outputs = outer_step(
+                        inr,
+                        graph,
+                        inner_steps,
+                        alpha,
+                        is_train=False,
+                        return_reconstructions=False,
+                        gradient_checkpointing=False,
+                        use_rel_loss=use_rel_loss,
+                        loss_type="mse",
+                    )
 
-                loss = outputs["loss"]
-                fit_test_mse += loss.item() * n_samples
+                    loss = outputs["loss"]
+                    fit_test_mse += loss.item() * n_samples
 
-                if use_rel_loss:
-                    rel_test_mse += outputs["rel_loss"].item() * n_samples
+                    if use_rel_loss:
+                        rel_test_mse += outputs["rel_loss"].item() * n_samples
 
             test_loss = fit_test_mse / ntest
 
             if use_rel_loss:
                 rel_test_loss = rel_test_mse / ntest
             
-            print('test loss')
+            print(f'{step}, test loss')
             print(test_loss)
-            print(rel_test_loss)
+            # print(rel_test_loss)
 
-        if True in (step_show, step_show_last) and cfg.wandb.use_wandb:
-            wandb.log(
-                {
-                    "test_rel_loss": rel_test_loss,
-                    "train_rel_loss": rel_train_loss,
-                    "test_loss": test_loss,
-                    "train_loss": train_loss,
-                },
-                step=step
-            )
+            if cfg.wandb.use_wandb:
+                wandb.log(
+                    {
+                        "test_rel_loss": rel_test_loss,
+                        "train_rel_loss": rel_train_loss,
+                        "test_loss": test_loss,
+                        "train_loss": train_loss,
+                    },
+                    step=step
+                )
         
+            if test_loss < best_loss:
+                best_loss = test_loss
 
-        if test_loss < best_loss:
-            best_loss = test_loss
-
-            # try:
-            #     savepath = f"{RESULTS_DIR}/{run_name}.pt"
-            # except:
-            savepath = f'/pscratch/sd/g/gzhao27/INR/SOMA/{current_date_str+run_name}.pt'
-            print(savepath)
-            torch.save(
-                {
-                    "cfg": cfg,
-                    "epoch": step,
-                    "inr": inr.state_dict(),
-                    "optimizer_inr": optimizer.state_dict(),
-                    "loss": best_loss,
-                    "alpha": alpha,
-                    "feat_transform": feat_transform,
-                    "feat_inv_transform": feat_inv_transform, 
-                    # "grid_tr": grid_tr,
-                    # "grid_te": grid_te,
-                },
-                savepath,
-            )
+                # try:
+                #     savepath = f"{RESULTS_DIR}/{run_name}.pt"
+                # except:
+                savepath = f'/pscratch/sd/g/gzhao27/INR/SOMA/{current_date_str+run_name}.pt'
+                print('savepath:', savepath)
+                torch.save(
+                    {
+                        "cfg": cfg,
+                        "epoch": step,
+                        "inr": inr.state_dict(),
+                        "optimizer_inr": optimizer.state_dict(),
+                        "loss": best_loss,
+                        "alpha": alpha,
+                        "feat_transform": feat_transform,
+                        "feat_inv_transform": feat_inv_transform, 
+                        # "grid_tr": grid_tr,
+                        # "grid_te": grid_te,
+                    },
+                    savepath,
+                )
         
     return rel_test_loss
 

@@ -30,7 +30,7 @@ python /pscratch/sd/g/gzhao27/INR/SOMA/coralsoma/inr.py \
     data.time_factor=2 \
     data.ntrain=80 \
     data.ntest=20 \
-    optim.batch_size=8 \
+    optim.batch_size=2 \
     optim.lr_inr=0.001 \
     optim.epochs=$epochs \
     inr.latent_dim=$latent_dim \
@@ -39,6 +39,6 @@ python /pscratch/sd/g/gzhao27/INR/SOMA/coralsoma/inr.py \
     wandb.saved_checkpoint=False \
     wandb.name=$run_name \
     wandb.use_wandb=True \
-    wandb.project=somainr \
+    wandb.project=soma-inr \
     inr.w0=$w0
     

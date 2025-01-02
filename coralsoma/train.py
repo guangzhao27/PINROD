@@ -269,6 +269,8 @@ def main(cfg: DictConfig) -> None:
             input_dim=input_dim,
             output_dim=output_dim,
         )
+        
+        #this function requires to change dataset
         z_mean, z_std = load_graph_modulations(
             trainset,
             inr,
@@ -277,6 +279,7 @@ def main(cfg: DictConfig) -> None:
             alpha=alpha,
             batch_size=4,
         )
+        
         
         z_transform = lambda tensor: (tensor - z_mean) / z_std
         z_invtransform = lambda tensor: (tensor * z_std) + z_mean

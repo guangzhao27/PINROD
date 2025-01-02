@@ -15,11 +15,12 @@ data:
   sub_from :
   space_factor : 2 # space resolution
   time_factor : 2
-  seed: 123
+  seed: 23
   same_grid: True
   seq_inter_len : 20 
   seq_extra_len : 20
   missing_rate: 0.0
+  sub_array_num: 1
 
 optim:
   batch_size: 32
