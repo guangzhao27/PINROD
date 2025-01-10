@@ -5,13 +5,90 @@ import einops
 import torch
 from torch.utils.data import DataLoader
 from torch_geometric.loader import DataLoader as GeometricLoader
-from coral.metalearning import outer_step, graph_outer_step
+from coral.metalearning import graph_outer_step as outer_step
 import sys
 sys.path.append('/pscratch/sd/g/gzhao27/INR/coral')
 sys.path.append(str(Path(__file__).parents[1]))
 from coral.utils.models.scheduling import ode_scheduling
 from utils.data.unstructure_dataset import GraphNavierStokes, collate_graph_inr, GraphSomaDataset
+from torch_geometric.data import Data
+from torch.utils.data import Dataset
 
+def load_soma_graph_modulations_each_frame(
+    inr_save_name, 
+    inr, 
+    trainset, 
+    type, 
+    device,
+    inner_steps,
+    alpha,
+    
+):
+    N = len(trainset)
+    latent_dim = trainset.latent_dim
+    time_factor = trainset.time_factor
+    space_factor = trainset.space_factor
+    T = trainset.T
+    
+    modulation_path = os.path.join(
+        '/pscratch/sd/g/gzhao27/INR/SOMA/results/soma_modulation',
+        inr_save_name + f'num{N}ld{latent_dim}tf{time_factor}sf{space_factor}-{type}.pt'
+        )
+    
+    if not os.path.exists(modulation_path):
+        modulations = torch.zeros(N, T, latent_dim)
+        pde_tensor = torch.zeros(N, 1)
+        for i in range(N):
+            graph = trainset[i]
+            for t in range(T):
+                graph0 = Data()
+                booltensor = graph.time == t
+                graph0.images = graph.feat[booltensor].to(device)
+                graph0.pos = graph.space_emb[booltensor].to(device)
+                graph0.batch = (graph.time[booltensor] - graph.time[booltensor].min()).to(device) 
+                graph0.modulations = graph.latent_vector[[t]].to(device)
+                
+                outputs = outer_step(
+                    inr, 
+                    graph0, 
+                    inner_steps, 
+                    alpha, 
+                    is_train=False, 
+                    return_reconstructions=False, 
+                    gradient_checkpointing=True,
+                    use_rel_loss=False,
+                    loss_type="mse",
+                )
+                
+                z0 = outputs["modulations"].cpu().detach()
+                modulations[i, t] = z0
+            pde_tensor[i] = graph.pde_parameter
+        torch.save(
+            {
+                'modulations': modulations, 
+                'pde_tensor': pde_tensor,
+            },
+            modulation_path)
+    else:
+        save_data = torch.load(modulation_path)
+        modulations = save_data['modulations']
+        pde_tensor = save_data['pde_tensor']
+    
+    # properties_to_keep = ['latent_vector', 'pde_parameter'] 
+    # for i in range(N):
+    #     # trainset.update_latent_vector(i, modulations[i])
+    #     graph = trainset[i]
+    #     pde_tensor[i] = graph.pde_parameter
+        # for key in list(graph.keys()):
+        #     if key not in properties_to_keep:
+        #         del graph[key]
+                
+    train_modulation_set = ModulationDataset(modulations, pde_tensor)
+    
+    z_mean = modulations.mean().item()
+    z_std = modulations.std().item()
+    return z_mean, z_std, train_modulation_set
+            
 
 def load_graph_modulations(
     trainset,
@@ -44,12 +121,12 @@ def load_graph_modulations(
         graph.modulations = graph.latent_vector
         graph.to(device)
         # with torch.no_grad():
-        outputs = graph_outer_step(
+        outputs = outer_step(
             inr,
             graph,
             inner_steps,
             alpha,
-            is_train=True,
+            is_train=False,
             return_reconstructions=False,
             gradient_checkpointing=False,
             use_rel_loss=False,
@@ -102,6 +179,7 @@ def graph_ode_inr_predict(model, inr, graph, timestamps=None, z_transform=None, 
     modulations = graph.latent_vector.to(device)
     latent_dim = modulations.size(-1)
     
+    # TODO: break the batch into small batch to reduce memory requirements
     inr_pred = inr.modulated_forward(coords, modulations[batch])
     inr_pred_loss = ((images - inr_pred)**2).mean()
     
@@ -130,6 +208,8 @@ def graph_ode_inr_predict(model, inr, graph, timestamps=None, z_transform=None, 
         z_pred = z_invtransform(z_pred)
     z_pred = z_pred.permute(0, 2, 1)
     z_pred = z_pred.reshape(n_samples*T, latent_dim)
+    
+    # TODO: break the batch into small batch to reduce memory requirements
     ode_pred = inr.modulated_forward(coords, z_pred[batch])
     ode_pred_loss = ((images - ode_pred)**2).mean()
     
@@ -150,3 +230,17 @@ def graph_ode_inr_predict(model, inr, graph, timestamps=None, z_transform=None, 
     }
     
     return outputs
+
+
+class ModulationDataset(Dataset):
+    
+    def __init__(self, modulations, pde_tensor):
+        self.modulations = modulations 
+        self.pde_tensor = pde_tensor
+        
+    def __len__(self):
+        return self.modulations.size(0)
+    
+    def __getitem__(self, idx):
+        return Data(latent_vector=self.modulations[idx], pde_parameter=self.pde_tensor[idx])
+        

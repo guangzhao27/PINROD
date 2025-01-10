@@ -28,10 +28,14 @@ fi
 
 python /pscratch/sd/g/gzhao27/INR/SOMA/coralsoma/train.py \
     data.dataset_name=SOMA \
+    data.data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5' \
+    data.mmap_dir='/pscratch/sd/g/gzhao27/INR/SOMA/results/soma_mmap_save' \
     dynamics.width=512 \
     dynamics.depth=3 \
     data.space_factor=2 \
     data.time_factor=2 \
+    data.ntrain=80 \
+    data.ntest=10 \
     optim.epochs=$epochs \
     data.seq_inter_len=20 \
     data.seq_extra_len=20 \

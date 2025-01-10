@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from dynamics_modeling.eval import batch_eval_loop
 from torch.utils.data import DataLoader
+from torch_geometric.data import DataLoader as GDataLoader
 from datetime import datetime
 from functools import partial
 
@@ -21,14 +22,73 @@ from coral.utils.plot import show
 from coral.utils.models.scheduling import ode_scheduling
 from coral.utils.models.load_inr import create_inr_instance, load_inr_model
 from coral.utils.models.get_inr_reconstructions import get_reconstructions
-from load_modulations import load_graph_modulations, graph_ode_inr_predict
+from load_modulations import load_graph_modulations, graph_ode_inr_predict, load_soma_graph_modulations_each_frame
 from coral.utils.data.load_data import get_dynamics_data, set_seed
 from coral.utils.data.dynamics_dataset import (KEY_TO_INDEX, TemporalDatasetWithCode)
 from coral.mlp import Derivative, ParameterizedDerivative
 from torchdiffeq import odeint
 from omegaconf import DictConfig, OmegaConf
-from utils.data.unstructure_dataset import GraphNavierStokes, collate_graph_inr, GraphSomaDataset, create_burgers_dataset, soma_claculate_p_normalize
+from utils.data.unstructure_dataset import (
+    GraphNavierStokes, collate_graph_inr, GraphSomaDataset, 
+    create_burgers_dataset, soma_claculate_p_normalize,
+    create_soma_dataset,
+                                            )
+from time import time
 
+def train_step(step, train_loader, model, device, T_train, latent_dim, z_transform, timestamps_train, epsilon_t, parameterized, optimizer, ntrain):
+    
+    pred_train_mse = 0
+    code_train_mse = 0
+    start = time()
+    for substep, graph in enumerate(train_loader):
+        model.train()
+        n_samples = len(graph)
+        modulations = graph.latent_vector
+        modulations = modulation_fix(modulations, n_samples, T_train, latent_dim, z_transform, device=device)
+        graph = graph.to(device)
+        if hasattr(graph, 'time_emb'):
+            timestamps = graph[0].time_emb.to(device)
+        else:
+            timestamps = timestamps_train
+        z_pred = ode_pred_z(model, graph, modulations, timestamps, epsilon_t, parameterized)
+        loss = ((z_pred - modulations) ** 2).mean()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        code_train_mse += loss.item() * n_samples
+
+    code_train_mse = code_train_mse / ntrain
+    print('train loss:', code_train_mse)
+    print('time:', time()-start)
+        
+    return code_train_mse
+
+
+def val_step(step, val_loader, model, device, T_val, latent_dim, z_transform, timestamps_val, parameterized, nval):
+    code_val_mse = 0
+    image_val_mse = 0
+    for substep, graph in enumerate(val_loader):
+        # graph = graph.to(device)##
+        
+        model.eval()
+        n_samples = len(graph)
+        graph = graph.to(device)
+        modulations = graph.latent_vector
+        modulations = modulation_fix(modulations, n_samples, T_val, latent_dim, z_transform, device)
+        if hasattr(graph, 'time_emb'):
+            timestamps = graph[0].time_emb.to(device)
+        else:
+            timestamps = timestamps_val
+        z_pred = ode_pred_z(model, graph, modulations, timestamps_val, 0, parameterized)
+        
+        loss = ((z_pred - modulations) ** 2).mean()
+        code_val_mse += loss.item() * n_samples
+
+    code_val_mse = code_val_mse/nval
+    print(f"{step}, val latent loss:", code_val_mse)
+    # print("val image loss:", image_val_mse)
+    
+    return code_val_mse
 
 class DetailedMSE():
     def __init__(self, keys, dataset_name="shallow-water-dino", mode="train", n_trajectories=256):
@@ -78,6 +138,7 @@ def ode_pred_z(model, graph, modulations, timestamps, epsilon, parameterized):
 
 @hydra.main(config_path="../config/", config_name="ode.yaml")
 def main(cfg: DictConfig) -> None:
+    print(OmegaConf.to_yaml(cfg))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # neceassary for some reason now
     torch.set_default_dtype(torch.float32)
@@ -85,9 +146,11 @@ def main(cfg: DictConfig) -> None:
     
     # data
     data_dir = cfg.data.dir
+    data_path = cfg.data.data_path
     dataset_name = cfg.data.dataset_name
     ntrain = cfg.data.ntrain
     ntest = cfg.data.ntest
+    mmap_dir = cfg.data.mmap_dir
     data_to_encode = cfg.data.data_to_encode
     space_factor = cfg.data.space_factor
     time_factor = cfg.data.time_factor
@@ -95,8 +158,10 @@ def main(cfg: DictConfig) -> None:
     same_grid = cfg.data.same_grid
     seq_inter_len = cfg.data.seq_inter_len
     seq_extra_len = cfg.data.seq_extra_len
-    
     missing_rate = cfg.data.missing_rate
+    val_missing_rate = cfg.data.val_missing_rate
+    sub_array_num = cfg.data.sub_array_num
+    
     train_num = cfg.train_num
     p_dim = cfg.p_dim
 
@@ -124,7 +189,7 @@ def main(cfg: DictConfig) -> None:
     epsilon_t = cfg.dynamics.teacher_forcing_decay
     epsilon_freq = cfg.dynamics.teacher_forcing_update
     para_type = cfg.para_type
-    assert para_type in ['no-parameter', 'concatenate', 'modulation']
+    assert para_type in ['no-parameter', 'concatenate', 'concatenate_test', 'modulation']
     if para_type == 'no-parameter':
         parameterized = False
     else:
@@ -186,7 +251,7 @@ def main(cfg: DictConfig) -> None:
         tmp = torch.load(os.path.join(inr_save_dir, inr_save_name+'.pt'))
         latent_dim = tmp["cfg"].inr.latent_dim
         # print('fix sub_tr to space_factor')
-        space_factor = tmp["cfg"].data.space_factor
+        # space_factor = tmp["cfg"].data.space_factor
         seed = tmp["cfg"].data.seed
     else:
         raise NotImplementedError("save file is empty")
@@ -202,41 +267,45 @@ def main(cfg: DictConfig) -> None:
         input_dim = 3
         output_dim = 1
         feature_set = [10]
-        data_path = '/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5'
-        # p_mean, p_std = soma_claculate_p_normalize(data_path)
-        print('for soma thedataset-impliciBottomDrag p_mean and p_std pre-calculated: 0.005342233, 0.002689823')
-        p_mean, p_std = 0.005342233, 0.002689823 # for 
-        p_transform = lambda tensor: (tensor - p_mean) / p_std
-        p_invtransform = lambda tensor: (tensor * p_std) + p_mean
-        trainset = GraphSomaDataset(
-            data_path=data_path,
-            train_num=80, 
-            feature_set=[10],
-            space_factor=4,
-            time_factor=2, 
-            latent_dim=latent_dim,
-            p_transform=p_transform,
-        )
-        valset = GraphSomaDataset(
-            data_path=data_path,
-            train_num=10, 
-            feature_set=[10],
-            space_factor=4,
-            time_factor=2, 
-            latent_dim=latent_dim,
-            split='val', 
-            p_transform=p_transform,
-        )
-        testset = GraphSomaDataset(
-            data_path=data_path,
-            train_num=10, 
-            feature_set=[10],
-            space_factor=4,
-            time_factor=2, 
-            latent_dim=latent_dim,
-            split='test', 
-            p_transform=p_transform,
-        )
+        trainset, valset, testset, feat_transform,  feat_inv_transform = create_soma_dataset(
+            ntrain, mmap_dir, space_factor, time_factor, 
+            latent_dim, missing_rate, val_missing_rate, 
+            feature_set, data_path=data_path)
+        # data_path = '/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5'
+        # # p_mean, p_std = soma_claculate_p_normalize(data_path)
+        # print('for soma thedataset-impliciBottomDrag p_mean and p_std pre-calculated: 0.005342233, 0.002689823')
+        # p_mean, p_std = 0.005342233, 0.002689823 # for 
+        # p_transform = lambda tensor: (tensor - p_mean) / p_std
+        # p_invtransform = lambda tensor: (tensor * p_std) + p_mean
+        # trainset = GraphSomaDataset(
+        #     data_path=data_path,
+        #     train_num=80, 
+        #     feature_set=[10],
+        #     space_factor=4,
+        #     time_factor=2, 
+        #     latent_dim=latent_dim,
+        #     p_transform=p_transform,
+        # )
+        # valset = GraphSomaDataset(
+        #     data_path=data_path,
+        #     train_num=10, 
+        #     feature_set=[10],
+        #     space_factor=4,
+        #     time_factor=2, 
+        #     latent_dim=latent_dim,
+        #     split='val', 
+        #     p_transform=p_transform,
+        # )
+        # testset = GraphSomaDataset(
+        #     data_path=data_path,
+        #     train_num=10, 
+        #     feature_set=[10],
+        #     space_factor=4,
+        #     time_factor=2, 
+        #     latent_dim=latent_dim,
+        #     split='test', 
+        #     p_transform=p_transform,
+        # )
     elif dataset_name == "Burgers":
         input_dim = 1
         output_dim = 1
@@ -270,53 +339,83 @@ def main(cfg: DictConfig) -> None:
             output_dim=output_dim,
         )
         
+        if dataset_name == 'SOMA':
+            z_mean, z_std, trainset = load_soma_graph_modulations_each_frame(
+                inr_save_name=inr_save_name,
+                inr=inr,
+                trainset=trainset,
+                type='train',
+                device=device,
+                inner_steps=inner_steps,
+                alpha=alpha,
+            )
+            
+            
+            z_transform = lambda tensor: (tensor - z_mean) / z_std
+            z_invtransform = lambda tensor: (tensor * z_std) + z_mean
+            
+            # train_p_list=(0.001, 0.002, 0.004, 0.02, 0.04, 0.1)
+            # p_mean = np.array(train_p_list).mean()
+            # p_std = np.array(train_p_list).std()
+            # p_transform = lambda tensor: (tensor - p_mean) / p_std
+            # p_invtransform = lambda tensor: (tensor * p_std) + p_mean
+            
+            _, _, valset = load_soma_graph_modulations_each_frame(
+                inr_save_name=inr_save_name,
+                inr=inr,
+                trainset=valset,
+                type='val',
+                device=device,
+                inner_steps=inner_steps,
+                alpha=alpha,
+            )
+        else:
+            raise NotImplementedError
         #this function requires to change dataset
-        z_mean, z_std = load_graph_modulations(
-            trainset,
-            inr,
-            device=device, 
-            inner_steps=inner_steps,
-            alpha=alpha,
-            batch_size=4,
-        )
-        
-        
-        z_transform = lambda tensor: (tensor - z_mean) / z_std
-        z_invtransform = lambda tensor: (tensor * z_std) + z_mean
-        
-        # train_p_list=(0.001, 0.002, 0.004, 0.02, 0.04, 0.1)
-        # p_mean = np.array(train_p_list).mean()
-        # p_std = np.array(train_p_list).std()
-        # p_transform = lambda tensor: (tensor - p_mean) / p_std
-        # p_invtransform = lambda tensor: (tensor * p_std) + p_mean
-        
-        load_graph_modulations(
-            valset,
-            inr,
-            device=device, 
-            inner_steps=inner_steps,
-            alpha=alpha,
-            batch_size=4,
-        )
+            z_mean, z_std = load_graph_modulations(
+                trainset,
+                inr,
+                device=device, 
+                inner_steps=inner_steps,
+                alpha=alpha,
+                batch_size=4,
+            )
+            
+            
+            z_transform = lambda tensor: (tensor - z_mean) / z_std
+            z_invtransform = lambda tensor: (tensor * z_std) + z_mean
+            
+            # train_p_list=(0.001, 0.002, 0.004, 0.02, 0.04, 0.1)
+            # p_mean = np.array(train_p_list).mean()
+            # p_std = np.array(train_p_list).std()
+            # p_transform = lambda tensor: (tensor - p_mean) / p_std
+            # p_invtransform = lambda tensor: (tensor * p_std) + p_mean
+            
+            load_graph_modulations(
+                valset,
+                inr,
+                device=device, 
+                inner_steps=inner_steps,
+                alpha=alpha,
+                batch_size=1,
+            )
 
     else:
         raise NotImplementedError
 
     # create torch dataset
-    train_loader = DataLoader(
+    train_loader = GDataLoader(
         trainset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=1,
-        collate_fn=collate_graph_inr,
         pin_memory=True,
     )
-    val_loader = DataLoader(
+    val_loader = GDataLoader(
         valset,
-        batch_size=4,
+        batch_size=1,
         shuffle=True,
         num_workers=1,
-        collate_fn=collate_graph_inr,
         pin_memory=True,
     )
     test_loader = DataLoader(
@@ -327,7 +426,7 @@ def main(cfg: DictConfig) -> None:
         num_workers=1,
     )
 
-    c = trainset[0].feat.size(-1)
+    c = output_dim
     if not parameterized:
         model = Derivative(c, latent_dim, hidden, depth).cuda()
     else:
@@ -388,8 +487,6 @@ def main(cfg: DictConfig) -> None:
     for step in range(epochs):
         step_show = step % 20 == 0
         step_show_last = step == epochs - 1
-        
-        
 
         if step % epsilon_freq == 0:
             epsilon_t = epsilon_t * epsilon
@@ -397,86 +494,104 @@ def main(cfg: DictConfig) -> None:
         if step < epoch_load:
             continue
         
-        print(step, epsilon_t)
+        code_train_mse = train_step(
+            step, train_loader, model, 
+            device, T_train, latent_dim, 
+            z_transform, timestamps_train, 
+            epsilon_t, parameterized, 
+            optimizer, ntrain)
 
-        pred_train_mse = 0
-        code_train_mse = 0
+        # pred_train_mse = 0
+        # code_train_mse = 0
 
-        for substep, graph in enumerate(train_loader):
-            model.train()
-            n_samples = len(graph)
-            modulations = graph.latent_vector
-            modulations = modulation_fix(modulations, n_samples, T_train, latent_dim, z_transform, device=device)
-            graph = graph.to(device)
-            if hasattr(graph, 'time_emb'):
-                timestamps = graph[0].time_emb.to(device)
-            else:
-                timestamps = timestamps_train
-            z_pred = ode_pred_z(model, graph, modulations, timestamps, epsilon_t, parameterized)
-            # if not parameterized:
-            #     _f = model
-            # else:
-            #     _f = partial(model, p=graph.pde_parameter)
-            # z_pred = ode_scheduling(odeint, _f, modulations, timestamps_train, epsilon_t) #it uses timestamps_train defined explicitly, that's not good
-            loss = ((z_pred - modulations) ** 2).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            code_train_mse += loss.item() * n_samples
+        # for substep, graph in enumerate(train_loader):
+        #     model.train()
+        #     n_samples = len(graph)
+        #     modulations = graph.latent_vector
+        #     modulations = modulation_fix(modulations, n_samples, T_train, latent_dim, z_transform, device=device)
+        #     graph = graph.to(device)
+        #     if hasattr(graph, 'time_emb'):
+        #         timestamps = graph[0].time_emb.to(device)
+        #     else:
+        #         timestamps = timestamps_train
+        #     z_pred = ode_pred_z(model, graph, modulations, timestamps, epsilon_t, parameterized)
+        #     # if not parameterized:
+        #     #     _f = model
+        #     # else:
+        #     #     _f = partial(model, p=graph.pde_parameter)
+        #     # z_pred = ode_scheduling(odeint, _f, modulations, timestamps_train, epsilon_t) #it uses timestamps_train defined explicitly, that's not good
+        #     loss = ((z_pred - modulations) ** 2).mean()
+        #     optimizer.zero_grad()
+        #     loss.backward()
+        #     optimizer.step()
+        #     code_train_mse += loss.item() * n_samples
 
-            # if True in (step_show, step_show_last):
+        #     # if True in (step_show, step_show_last):
 
-                # pred = get_reconstructions(
-                #     inr, coords, z_pred, z_mean, z_std, dataset_name
-                # )
-                # pred_train_mse += ((pred - images) ** 2).mean() * n_samples
+        #         # pred = get_reconstructions(
+        #         #     inr, coords, z_pred, z_mean, z_std, dataset_name
+        #         # )
+        #         # pred_train_mse += ((pred - images) ** 2).mean() * n_samples
                 
-                # if multichannel:
-                #     detailed_train_mse.aggregate(pred, images)  ???????
+        #         # if multichannel:
+        #         #     detailed_train_mse.aggregate(pred, images)  ???????
 
-        code_train_mse = code_train_mse / ntrain
-        print(code_train_mse)
+        # code_train_mse = code_train_mse / ntrain
+        # pred_train_mse = pred_train_mse / ntrain
+        
+        # print(code_train_mse)
 
         if True in (step_show, step_show_last):
-            pred_train_mse = pred_train_mse / ntrain
-            code_val_mse = 0
-            image_val_mse = 0
-            for substep, graph in enumerate(val_loader):
-                # graph = graph.to(device)##
+            
+            code_val_mse = val_step(
+                step, val_loader, model, 
+                device, T_val, latent_dim,
+                z_transform, timestamps_val, 
+                parameterized, nval)
+            # code_val_mse = 0
+            # image_val_mse = 0
+            # for substep, graph in enumerate(val_loader):
+            #     # graph = graph.to(device)##
                 
-                model.eval()
-                n_samples = len(graph)
-                # modulations = graph.latent_vector
-                # modulations = modulation_fix(modulations, n_samples, T_val, latent_dim, z_transform)
-                # z_pred = ode_pred_z(model, graph, modulations, timestamps_val, 0, parameterized)
+            #     model.eval()
+            #     n_samples = len(graph)
+            #     graph = graph.to(device)
+            #     modulations = graph.latent_vector
+            #     modulations = modulation_fix(modulations, n_samples, T_val, latent_dim, z_transform, device=device)
+            #     if hasattr(graph, 'time_emb'):
+            #         timestamps = graph[0].time_emb.to(device)
+            #     else:
+            #         timestamps = timestamps_train
+            #     z_pred = ode_pred_z(model, graph, modulations, timestamps_val, 0, parameterized)
                 
-                # # if not parameterized:
-                # #     _f = model
-                # # else:
-                # #     _f = partial(model, p=graph.pde_parameter)
+            #     # # if not parameterized:
+            #     # #     _f = model
+            #     # # else:
+            #     # #     _f = partial(model, p=graph.pde_parameter)
                 
-                # # z_pred = ode_scheduling(odeint, _f, modulations, timestamps_val, epsilon=0)
-                # loss = ((z_pred - modulations) ** 2).mean()
-                # code_val_mse += loss.item() * n_samples
+            #     # # z_pred = ode_scheduling(odeint, _f, modulations, timestamps_val, epsilon=0)
+            #     loss = ((z_pred - modulations) ** 2).mean()
+            #     code_val_mse += loss.item() * n_samples
 
-                outputs = graph_ode_inr_predict(
-                    model, 
-                    inr, 
-                    graph, 
-                    z_transform=z_transform, 
-                    z_invtransform=z_invtransform, 
-                    parameterized=parameterized,
-                    )
-                image_pred_loss = outputs['ode_pred_loss']
-                image_val_mse += image_pred_loss * n_samples
-                loss = outputs['z_pred_loss']
-                code_val_mse += loss.item() * n_samples
+            #     # this one requires too much memory
+            #     # outputs = graph_ode_inr_predict(
+            #     #     model, 
+            #     #     inr, 
+            #     #     graph, 
+            #     #     z_transform=z_transform, 
+            #     #     z_invtransform=z_invtransform, 
+            #     #     parameterized=parameterized,
+            #     #     )
+            #     # image_pred_loss = outputs['ode_pred_loss']
+            #     # image_val_mse += image_pred_loss * n_samples
+            #     # loss = outputs['z_pred_loss']
+            #     # code_val_mse += loss.item() * n_samples
                 
             
-            image_val_mse = image_val_mse/nval
-            code_val_mse = code_val_mse/nval
-            print("val latent loss:", code_val_mse)
-            print("val image loss:", image_val_mse)
+            # # image_val_mse = image_val_mse/nval
+            # code_val_mse = code_val_mse/nval
+            # print("val latent loss:", code_val_mse)
+            # # print("val image loss:", image_val_mse)
             
             if cfg.wandb.use_wandb:
                 wandb.log(
@@ -484,12 +599,11 @@ def main(cfg: DictConfig) -> None:
                         "train/z_loss": code_train_mse,
                         "epsilon_t": epsilon_t,
                         "val/z_loss": code_val_mse,
-                        "val/image_loss": image_val_mse,
+                        # "val/image_loss": image_val_mse,
                     },
                     step=step,
                 )
             
-        
             if code_val_mse < best_loss:
                 best_loss = code_val_mse
                 # if code_val_mse < best_loss:

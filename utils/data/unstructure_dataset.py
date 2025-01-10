@@ -165,6 +165,7 @@ class GraphSomaDataset(Dataset):
                 data_save_dir=None, 
                 mmap_dir=None,
                 sub_array_num=1, 
+                missing_rate=0.0, 
                 ):
         self.name = "SOMA"
         self.data_path =data_path # 
@@ -174,6 +175,7 @@ class GraphSomaDataset(Dataset):
         self.time_factor = time_factor
         self.feature_set = feature_set
         self.latent_dim = latent_dim
+        self.missing_rate = missing_rate
         
         
         self.hdf5_file = h5py.File(self.data_path, 'r')
@@ -210,7 +212,7 @@ class GraphSomaDataset(Dataset):
         
             
         # this function generate self.T in its function
-        self.data_processing() # generate more self properties
+        self.cal_cor_and_time_emb() # generate more self properties
         
         if self.sub_array_num > 1:
             base_size = self.T // self.sub_array_num
@@ -252,32 +254,37 @@ class GraphSomaDataset(Dataset):
             ::self.time_factor
         ]
         
+        assert len(self.feature_set) == 1
+        _data = _data[..., self.feature_set]
+        
         # Apply feature set reduction if provided
         # if self.feature_set is not None:
         #     _data = _data[..., self.feature_set]
         
         return _data
     
-    def data_processing(self):
+    def cal_cor_and_time_emb(self):
         # _data = self.hdf5_file[self.keys[0]][:] # just take first data to get data shape information
         _data = self.load_raw_data(0)
         # _data = torch.from_numpy(_data)
-        _data = _data.permute(1, 2, 3, 0, 4) 
-        data = _data[..., :-1]
-        sx, sy, sz = data.shape[0:3]
-        total_T = _data.size(3)
+        # data = _data[..., :-1]
+        sx, sy, sz = _data.shape[0:3]
+        # total_T = _data.size(3)
+        
+        _data = self.reduce_resolution(_data)
 
-        _data = _data[::self.space_factor, 
-                      ::self.space_factor, 
-                      ::self.space_factor, 
-                      ::self.time_factor
-                      ]
+        # _data = _data[::self.space_factor, 
+        #               ::self.space_factor, 
+        #               ::self.space_factor, 
+        #               ::self.time_factor
+        #               ]
 
-        assert len(self.feature_set) == 1
-        _data = _data[..., self.feature_set]
+        
+        # if self.feature_set is not None:
+        #     _data = _data[..., self.feature_set]
 
         self.mask = _data[..., 0, 0]> -1000
-        self.mu, self.sigma = self.gen_normalize_value(_data) # self.mu and self.sigma is the average over the first single data with index=0, you should not do that!, that is hard to update
+        # self.mu, self.sigma = self.gen_normalize_value(_data) # self.mu and self.sigma is the average over the first single data with index=0, you should not do that!, that is hard to update
         
         
         # generate graph coordinates
@@ -382,48 +389,76 @@ class GraphSomaDataset(Dataset):
     def load_raw_data(self, idx):
         if self.mmap_dir:
             rawidx = self.idx_list[idx]
-            return torch.from_numpy(self.mmap_data[rawidx])
+            _data = torch.from_numpy(self.mmap_data[rawidx])
+        else:        
+            key = self.keys[idx]
+            _data = torch.from_numpy(self.hdf5_file[key][:])
         
-        key = self.keys[idx]
-        _data = torch.from_numpy(self.hdf5_file[key][:])
-        
+        _data = _data.permute(1, 2, 3, 0, 4)
         return _data
         
     def getitem(self, idx):
         # Y (trajectory) data dimension should be batch*sx*sy*sz*time*D
+        """
+        graph:
+            cor: the cor of each independent point (x, y, z)
+            time: time sequence lable for each independent point [0, 0, 0, 1, 1, 2, ...]
+                For a batch of data points, the time label will stack together, the next time sequence start with T as [T, T, T, T+1, T+1, ...]
+            feat: feature value of each point
+            T: total time of each data points (time sequence)
+            latent_vector: size of T*hidden_D for each data points
+            pde_parameter: size of 1*p_D for each data points
+            spacial_emb_t: the cor embedding of each independent point (xe, ye, ze)
+        """
 
         _data = self.load_raw_data(idx)
-        _data = _data.permute(1, 2, 3, 0, 4)
-        data = _data[..., :-1]
-
         pde_parameter = _data[0, 0, 0,0,  -1:]
+        
+        
+        # _data = _data[..., :-1]
+        
+
         if self.p_transform:
             pde_parameter = self.p_transform(pde_parameter)
-            
         
         #reduce datasize
-        data = data[
-                    ::self.space_factor, 
-                    ::self.space_factor, 
-                    ::self.space_factor, 
-                    ::self.time_factor,
-                    ]
-        if self.feature_set is not None:
-            data = data[..., self.feature_set]
+        _data = self.reduce_resolution(_data)
+        # _data = _data[
+        #             ::self.space_factor, 
+        #             ::self.space_factor, 
+        #             ::self.space_factor, 
+        #             ::self.time_factor,
+        #             ]
+        # if self.feature_set is not None:
+        #     _data = _data[..., self.feature_set]
+            
+        feat_t_whole = _data[self.cor_t[:, 0], self.cor_t[:, 1], self.cor_t[:, 2], self.time_t]
+        
+            
+        if self.feature_transform:
+            feat_t_whole = self.feature_transform(feat_t_whole)
         
         # self.normalize_data(data)
-        
-        
-        feat_t = data[self.cor_t[:, 0], self.cor_t[:, 1], self.cor_t[:, 2], self.time_t]
+        if self.missing_rate > 0:
+            random_mask = torch.rand(self.cor_t.size(0)) > self.missing_rate
+            cor_t = self.cor_t[random_mask]
+            spacial_emb_t = self.spacial_emb_t[random_mask]
+            time_t = self.time_t[random_mask]
+            feat_t = feat_t_whole[random_mask]
+        else:
+            feat_t = feat_t_whole
+            cor_t = self.cor_t
+            spacial_emb_t = self.spacial_emb_t
+            time_t = self.time_t
+            
         # feat_t_ori = feat_t.clone()
-        if self.feature_transform:
-            feat_t = self.feature_transform(feat_t)
+        
 
         # change to datapoint and store as a dataset
         graph = Data(
-            cor=self.cor_t, time=self.time_t, feat=feat_t, 
-            T=torch.tensor(data.size(3)), latent_vector=self.latent_vectors[idx], pde_parameter=pde_parameter,
-            space_emb=self.spacial_emb_t, 
+            cor=cor_t, time=time_t, feat=feat_t, 
+            T=torch.tensor(_data.size(3)), latent_vector=self.latent_vectors[idx], pde_parameter=pde_parameter,
+            space_emb=spacial_emb_t, 
             # feat_ori=feat_t_ori,
             )
         return graph
@@ -801,3 +836,63 @@ def soma_claculate_p_normalize(data_path):
     
     p_array = np.array(p_list)
     return p_array.mean(), p_array.std()
+
+def create_soma_dataset(ntrain, mmap_dir, space_factor, time_factor, latent_dim, missing_rate, val_missing_rate, feature_set, data_path, ):
+    print('for soma thedataset-impliciBottomDrag p_mean and p_std pre-calculated: 0.005342233, 0.002689823')
+    p_mean, p_std = 0.005342233, 0.002689823 # for 
+    p_transform = lambda tensor: (tensor - p_mean) / p_std
+    p_invtransform = lambda tensor: (tensor * p_std) + p_mean
+    
+    trainset0 = GraphSomaDataset(
+        data_path=data_path,
+        train_num=ntrain, 
+        feature_set=feature_set,
+        space_factor=space_factor,
+        time_factor=time_factor, 
+        latent_dim=latent_dim,
+        mmap_dir=mmap_dir,
+        missing_rate=0.0,
+    )
+    # create a separate create normlize transform function, avoid it to be related to the dataset sampling strategy
+    feat_transform, feat_inv_transform = trainset0.create_normalize_from_dataset() 
+    trainset = GraphSomaDataset(
+        data_path=data_path,
+        train_num=ntrain, 
+        feature_set=feature_set,
+        space_factor=space_factor,
+        time_factor=time_factor, 
+        latent_dim=latent_dim,
+        p_transform=p_transform,
+        mmap_dir=mmap_dir,
+        missing_rate=missing_rate,
+    )
+    trainset.update_feat_transform(feat_transform)
+    valset = GraphSomaDataset(
+        data_path=data_path,
+        train_num=ntrain, 
+        data_num=10,
+        feature_set=feature_set,
+        space_factor=space_factor,
+        time_factor=time_factor, 
+        latent_dim=latent_dim,
+        split='val',
+        p_transform=p_transform,
+        feature_transform=feat_transform,
+        mmap_dir=mmap_dir,
+        missing_rate=val_missing_rate,
+    )
+    testset = GraphSomaDataset(
+        data_path=data_path,
+        train_num=ntrain, 
+        data_num=10,
+        feature_set=[10],
+        space_factor=space_factor,
+        time_factor=time_factor, 
+        latent_dim=latent_dim,
+        split='test',
+        p_transform=p_transform,
+        feature_transform=feat_transform,
+        mmap_dir=mmap_dir,
+    )
+    
+    return trainset, valset, testset, feat_transform, feat_inv_transform

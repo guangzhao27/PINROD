@@ -13,12 +13,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import wandb
 from omegaconf import DictConfig, OmegaConf
-from utils.data.unstructure_dataset import (GraphNavierStokes, 
-                                            collate_graph_inr, 
-                                            GraphSomaDataset, 
-                                            GraphBurgers, 
-                                            create_burgers_dataset, 
-                                            )
+from utils.data.unstructure_dataset import (
+    GraphNavierStokes, 
+    collate_graph_inr, 
+    GraphSomaDataset, 
+    GraphBurgers, 
+    create_burgers_dataset, 
+    create_soma_dataset,
+    )
 
 
 from coral.losses import batch_mse_rel_fn
@@ -53,6 +55,175 @@ def divide_array_indexes(N, k):
     
     return indexes
 
+def train_step(step, train_loader, inr, sub_array_num, device, missing_rate, inner_steps, alpha, use_rel_loss, optimizer, ntrain):
+    
+    rel_train_mse = 0
+    fit_train_mse = 0
+    for substep, graph in enumerate(train_loader):
+            
+        # torch.cuda.empty_cache()
+        inr.train()
+        
+        # when set missing rate, then not using sub_array_num for training procedure
+        if sub_array_num>1 and (missing_rate is None or missing_rate < 1e-9):
+            graph_T = graph.time[-1]+1
+            time_indexes = divide_array_indexes(graph_T, sub_array_num)
+            
+            for tidx in time_indexes:
+                n_samples = len(tidx)
+                graph0 = Data()
+                booltensor = torch.isin(graph.time, tidx)
+                graph0.images = graph.feat[booltensor].to(device)
+                graph0.pos = graph.space_emb[booltensor].to(device)
+                graph0.batch = (graph.time[booltensor] - graph.time[booltensor].min()).to(device) 
+                # adjust the batch as the label of time frame starting with 0, batch is the label of time frame
+                graph0.modulations = graph.latent_vector[tidx].to(device)
+                
+                outputs = outer_step(
+                    inr,
+                    graph0,
+                    inner_steps,
+                    alpha,
+                    is_train=True,
+                    return_reconstructions=False,
+                    gradient_checkpointing=True,
+                    use_rel_loss=use_rel_loss,
+                    loss_type="mse",
+                )
+                
+                optimizer.zero_grad()
+                outputs["loss"].backward(create_graph=False)
+                
+                nn.utils.clip_grad_value_(inr.parameters(), clip_value=1.0)
+                optimizer.step()
+                loss = outputs["loss"].cpu().detach()
+                fit_train_mse += loss.item() * n_samples / graph_T.item()
+                
+                if use_rel_loss:
+                    rel_train_mse += outputs["rel_loss"].item() * n_samples / graph_T.item()
+                
+        else:
+            n_samples = len(graph)
+
+            #modify for outer_step function
+            graph.images = graph.feat.to(device)
+            graph.pos = graph.space_emb.to(device)
+            graph.batch = graph.time.to(device)
+            graph.modulations = graph.latent_vector.to(device) #torch.zeros_like(graph.latent_vector)
+            # graph.to(device)
+            
+            outputs = outer_step(
+                inr,
+                graph,
+                inner_steps,
+                alpha,
+                is_train=True,
+                return_reconstructions=False,
+                gradient_checkpointing=True,
+                use_rel_loss=use_rel_loss,
+                loss_type="mse",
+            )
+            
+            optimizer.zero_grad()
+            outputs["loss"].backward(create_graph=False)
+            nn.utils.clip_grad_value_(inr.parameters(), clip_value=1.0)
+            optimizer.step()
+            loss = outputs["loss"].cpu().detach()
+            fit_train_mse += loss.item() * n_samples
+            
+            if use_rel_loss:
+                rel_train_mse += outputs["rel_loss"].item() * n_samples
+        
+    train_loss = fit_train_mse / (ntrain)
+    
+    if use_rel_loss:
+        rel_train_loss = rel_train_mse / ntrain
+    else:
+        rel_train_loss = None
+        
+    print('train loss')
+    print(train_loss)
+    
+    return train_loss, rel_train_loss
+
+def validation_step(step, val_loader, inr, sub_array_num, device, inner_steps, alpha, use_rel_loss, ntest):
+    
+    fit_test_mse = 0
+    rel_test_mse = 0
+    
+    for substep, graph in enumerate(val_loader):
+        inr.eval()
+        
+        if sub_array_num>1:
+            graph_T = graph.time[-1]+1
+            time_indexes = divide_array_indexes(graph_T, sub_array_num)
+            
+            for tidx in time_indexes:
+                n_samples = len(tidx)
+                graph0 = Data()
+                booltensor = torch.isin(graph.time, tidx)
+                graph0.images = graph.feat[booltensor].to(device)
+                graph0.pos = graph.space_emb[booltensor].to(device)
+                graph0.batch = (graph.time[booltensor] - graph.time[booltensor].min()).to(device) 
+                # adjust the batch as the label of time frame starting with 0, batch is the label of time frame
+                graph0.modulations = graph.latent_vector[tidx].to(device)
+                
+                outputs = outer_step(
+                    inr, 
+                    graph0, 
+                    inner_steps, 
+                    alpha, 
+                    is_train=False, 
+                    return_reconstructions=False, 
+                    use_rel_loss=use_rel_loss,
+                    loss_type="mse",
+                )
+                
+                loss = outputs['loss']
+                fit_test_mse += loss.item() * n_samples/graph_T.item()
+                
+                if use_rel_loss:
+                    rel_test_mse += outputs['rel_loss'].item() * n_samples/graph_T.item()
+        else:
+            n_samples = len(graph)
+            
+            graph.images = graph.feat.to(device)
+            graph.pos = graph.space_emb.to(device)
+            graph.batch = graph.time.to(device)
+            graph.modulations = graph.latent_vector.to(device) #torch.zeros_like(graph.latent_vector)
+            # graph.modulations = torch.zeros_like(graph.latent_vector)
+            # graph.to(device)
+
+            outputs = outer_step(
+                inr,
+                graph,
+                inner_steps,
+                alpha,
+                is_train=False,
+                return_reconstructions=False,
+                gradient_checkpointing=False,
+                use_rel_loss=use_rel_loss,
+                loss_type="mse",
+            )
+
+            loss = outputs["loss"]
+            fit_test_mse += loss.item() * n_samples
+
+            if use_rel_loss:
+                rel_test_mse += outputs["rel_loss"].item() * n_samples
+
+    test_loss = fit_test_mse / ntest
+
+    if use_rel_loss:
+        rel_test_loss = rel_test_mse / ntest
+    else:
+        rel_test_loss = 0
+    
+    print(f'{step}, test loss')
+    print(test_loss)
+    
+    return test_loss, rel_test_loss
+
 @hydra.main(config_path="../config/", config_name="siren.yaml")
 def main(cfg: DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
@@ -79,6 +250,7 @@ def main(cfg: DictConfig) -> None:
 
     #data
     data_dir = cfg.data.dir
+    data_path = cfg.data.data_path
     dataset_name = cfg.data.dataset_name
     ntrain = cfg.data.ntrain
     ntest = cfg.data.ntest
@@ -92,6 +264,7 @@ def main(cfg: DictConfig) -> None:
     seq_inter_len = cfg.data.seq_inter_len
     seq_extra_len = cfg.data.seq_extra_len
     missing_rate = cfg.data.missing_rate
+    val_missing_rate = cfg.data.val_missing_rate
     sub_array_num = cfg.data.sub_array_num
 
     # optim
@@ -156,7 +329,7 @@ def main(cfg: DictConfig) -> None:
     set_seed(seed)
     
     # feature transform
-    feat_transform, feat_inv_transform = None, None
+    
 
     if dataset_name == "NS":
         input_dim=2
@@ -164,49 +337,73 @@ def main(cfg: DictConfig) -> None:
         trainset = GraphNavierStokes(split='train', ssub=space_factor, datanum=cfg.data.ntrain, missing_rate=missing_rate, latent_dim=latent_dim)
         valset = GraphNavierStokes(split='val', ssub=space_factor, trainnum=cfg.data.ntrain, datanum=cfg.data.ntest, missing_rate=missing_rate, latent_dim=latent_dim)
         testset = GraphNavierStokes(split='test', datanum=200, missing_rate=missing_rate, latent_dim=latent_dim)
+        feat_transform, feat_inv_transform = None, None
     elif dataset_name == "SOMA":
         # mmap_dir = '/pscratch/sd/g/gzhao27/INR/SOMA/results/soma_mmap_save'
         raw_np_dir = '/pscratch/sd/g/gzhao27/INR/SOMA/results/impliciBottomDrag_np'
         input_dim = 3
         output_dim = 1
         feature_set = [10]
-        trainset = GraphSomaDataset(
-            data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5',
-            train_num=ntrain, 
-            feature_set=[10],
-            space_factor=space_factor,
-            time_factor=time_factor, 
-            latent_dim=latent_dim,
-            mmap_dir=mmap_dir,
-        )
-        feat_transform, feat_inv_transform = trainset.create_normalize_from_dataset()
-        trainset.update_feat_transform(feat_transform)
-        valset = GraphSomaDataset(
-            data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5',
-            train_num=10, 
-            feature_set=[10],
-            space_factor=space_factor,
-            time_factor=time_factor, 
-            latent_dim=latent_dim,
-            split='val',
-            feature_transform=feat_transform,
-            mmap_dir=mmap_dir,
-        )
-        testset = GraphSomaDataset(
-            data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5',
-            train_num=10, 
-            feature_set=[10],
-            space_factor=space_factor,
-            time_factor=time_factor, 
-            latent_dim=latent_dim,
-            split='test',
-            feature_transform=feat_transform,
-            mmap_dir=mmap_dir,
-        )
+        
+        trainset, valset, testset, feat_transform,  feat_inv_transform = create_soma_dataset(
+            ntrain, mmap_dir, space_factor, time_factor, 
+            latent_dim, missing_rate, val_missing_rate, 
+            feature_set, data_path, )
+        
+        # trainset0 = GraphSomaDataset(
+        #     data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5',
+        #     train_num=ntrain, 
+        #     feature_set=[10],
+        #     space_factor=space_factor,
+        #     time_factor=time_factor, 
+        #     latent_dim=latent_dim,
+        #     mmap_dir=mmap_dir,
+        #     missing_rate=0.0,
+        # )
+        # # create a separate create normlize transform function, avoid it to be related to the dataset sampling strategy
+        # feat_transform, feat_inv_transform = trainset0.create_normalize_from_dataset() 
+        
+        # trainset = GraphSomaDataset(
+        #     data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5',
+        #     train_num=ntrain, 
+        #     feature_set=[10],
+        #     space_factor=space_factor,
+        #     time_factor=time_factor, 
+        #     latent_dim=latent_dim,
+        #     mmap_dir=mmap_dir,
+        #     missing_rate=missing_rate,
+        # )
+        # trainset.update_feat_transform(feat_transform)
+        # valset = GraphSomaDataset(
+        #     data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5',
+        #     train_num=ntrain, 
+        #     data_num=10,
+        #     feature_set=[10],
+        #     space_factor=space_factor,
+        #     time_factor=time_factor, 
+        #     latent_dim=latent_dim,
+        #     split='val',
+        #     feature_transform=feat_transform,
+        #     mmap_dir=mmap_dir,
+        #     missing_rate=val_missing_rate,
+        # )
+        # testset = GraphSomaDataset(
+        #     data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5',
+        #     train_num=ntrain, 
+        #     data_num=10,
+        #     feature_set=[10],
+        #     space_factor=space_factor,
+        #     time_factor=time_factor, 
+        #     latent_dim=latent_dim,
+        #     split='test',
+        #     feature_transform=feat_transform,
+        #     mmap_dir=mmap_dir,
+        # )
     elif dataset_name == "Burgers":
         input_dim = 1
         output_dim = 1
         trainset, valset, testset, p_mean, p_std = create_burgers_dataset()
+        feat_transform, feat_inv_transform = None, None
           
     else:
         raise NotImplementedError(f"The dataset ${dataset_name} does not have a corresponding class.")
@@ -273,178 +470,28 @@ def main(cfg: DictConfig) -> None:
     )
 
     for step in range(epoch_start, epochs):
-        rel_train_mse = 0
-        rel_test_mse = 0
-        fit_train_mse = 0
-        fit_test_mse = 0
+
         use_rel_loss = step % 10 == 0
         step_show = step % 10 == 0
         step_show_last = step == epochs - 1
+        
         start = time()
-        for substep, graph in enumerate(train_loader):
-            
-            # torch.cuda.empty_cache()
-            inr.train()
-            if sub_array_num>1:
-                graph_T = graph.time[-1]+1
-                time_indexes = divide_array_indexes(graph_T, sub_array_num)
-                print('time1:', time()-start)
-                start = time()
-                
-                for tidx in time_indexes:
-                    n_samples = len(tidx)
-                    graph0 = Data()
-                    booltensor = torch.isin(graph.time, tidx)
-                    graph0.images = graph.feat[booltensor].to(device)
-                    graph0.pos = graph.space_emb[booltensor].to(device)
-                    graph0.batch = graph.time[booltensor].to(device)
-                    graph0.modulations = graph.latent_vector.to(device)
-                    
-                    print('time2', time()-start)
-                    start = time()
-                    
-                    outputs = outer_step(
-                        inr,
-                        graph0,
-                        inner_steps,
-                        alpha,
-                        is_train=True,
-                        return_reconstructions=False,
-                        gradient_checkpointing=True,
-                        use_rel_loss=use_rel_loss,
-                        loss_type="mse",
-                    )
-                    print('time3', time()-start)
-                    start = time()
-                    
-                    print('memory:', torch.cuda.memory_allocated()/1024**3)
-                    optimizer.zero_grad()
-                    outputs["loss"].backward(create_graph=False)
-                    
-                    nn.utils.clip_grad_value_(inr.parameters(), clip_value=1.0)
-                    print('time4', time()-start)
-                    start = time()
-                    optimizer.step()
-                    loss = outputs["loss"].cpu().detach()
-                    fit_train_mse += loss.item() * n_samples / graph_T.item()
-                    
-                    if use_rel_loss:
-                        rel_train_mse += outputs["rel_loss"].item() * n_samples / graph_T.item()
-                    print('time5', time()-start)
-                    start = time()
-                    
-            else:
-                n_samples = len(graph)
-
-                #modify for outer_step function
-                graph.images = graph.feat.to(device)
-                graph.pos = graph.space_emb.to(device)
-                graph.batch = graph.time.to(device)
-                graph.modulations = graph.latent_vector.to(device) #torch.zeros_like(graph.latent_vector)
-                # graph.to(device)
-                
-                outputs = outer_step(
-                    inr,
-                    graph,
-                    inner_steps,
-                    alpha,
-                    is_train=True,
-                    return_reconstructions=False,
-                    gradient_checkpointing=False,
-                    use_rel_loss=use_rel_loss,
-                    loss_type="mse",
-                )
-                
-                optimizer.zero_grad()
-                outputs["loss"].backward(create_graph=False)
-                nn.utils.clip_grad_value_(inr.parameters(), clip_value=1.0)
-                optimizer.step()
-                loss = outputs["loss"].cpu().detach()
-                fit_train_mse += loss.item() * n_samples
-                
-                if use_rel_loss:
-                    rel_train_mse += outputs["rel_loss"].item() * n_samples
-            
-        train_loss = fit_train_mse / (ntrain)
-        
-        
-        if use_rel_loss:
-            rel_train_loss = rel_train_mse / ntrain
+        train_loss, rel_train_loss = train_step(
+            step, train_loader, inr, 
+            sub_array_num, device, missing_rate, 
+            inner_steps, alpha, 
+            use_rel_loss, optimizer, ntrain
+            )
         print('time:', time()-start)
-        print('train loss')
-        print(train_loss)
+        
 
         if True in (step_show, step_show_last):
-            for substep, graph in enumerate(val_loader):
-                inr.eval()
-                
-                if sub_array_num>1:
-                    graph_T = graph.time[-1]+1
-                    time_indexes = divide_array_indexes(graph_T, sub_array_num)
-                    
-                    for tidx in time_indexes:
-                        n_samples = len(tidx)
-                        graph0 = Data()
-                        booltensor = torch.isin(graph.time, tidx)
-                        graph0.images = graph.feat[booltensor].to(device)
-                        graph0.pos = graph.space_emb[booltensor].to(device)
-                        graph0.batch = graph.time[booltensor].to(device)
-                        graph0.modulations = graph.latent_vector.to(device)
-                        
-                        outputs = outer_step(
-                            inr, 
-                            graph0, 
-                            inner_steps, 
-                            alpha, 
-                            is_train=False, 
-                            return_reconstructions=False, 
-                            use_rel_loss=use_rel_loss,
-                            loss_type="mse",
-                        )
-                        
-                        loss = outputs['loss']
-                        fit_test_mse += loss.item() * n_samples/graph_T.item()
-                        
-                        if use_rel_loss:
-                            rel_test_mse += outputs['rel_loss'].item() * n_samples/graph_T.item()
-                else:
-                    n_samples = len(graph)
-                    
-                    
-                    
-                    graph.images = graph.feat.to(device)
-                    graph.pos = graph.space_emb.to(device)
-                    graph.batch = graph.time.to(device)
-                    graph.modulations = graph.latent_vector.to(device) #torch.zeros_like(graph.latent_vector)
-                    # graph.modulations = torch.zeros_like(graph.latent_vector)
-                    # graph.to(device)
-
-                    outputs = outer_step(
-                        inr,
-                        graph,
-                        inner_steps,
-                        alpha,
-                        is_train=False,
-                        return_reconstructions=False,
-                        gradient_checkpointing=False,
-                        use_rel_loss=use_rel_loss,
-                        loss_type="mse",
-                    )
-
-                    loss = outputs["loss"]
-                    fit_test_mse += loss.item() * n_samples
-
-                    if use_rel_loss:
-                        rel_test_mse += outputs["rel_loss"].item() * n_samples
-
-            test_loss = fit_test_mse / ntest
-
-            if use_rel_loss:
-                rel_test_loss = rel_test_mse / ntest
             
-            print(f'{step}, test loss')
-            print(test_loss)
-            # print(rel_test_loss)
+            test_loss, rel_test_loss = validation_step(
+                step, val_loader, inr, 
+                sub_array_num, device, 
+                inner_steps, alpha, use_rel_loss, ntest
+                )
 
             if cfg.wandb.use_wandb:
                 wandb.log(
@@ -464,7 +511,7 @@ def main(cfg: DictConfig) -> None:
                 #     savepath = f"{RESULTS_DIR}/{run_name}.pt"
                 # except:
                 savepath = f'/pscratch/sd/g/gzhao27/INR/SOMA/{current_date_str+run_name}.pt'
-                print('savepath:', savepath)
+                # print('savepath:', savepath)
                 torch.save(
                     {
                         "cfg": cfg,

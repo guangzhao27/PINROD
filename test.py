@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 import argparse
 
 from utils.data.unstructure_dataset import GraphNavierStokes, collate_graph_inr, GraphSomaDataset, GraphBurgers
-from coralsoma.load_modulations import graph_ode_inr_predict, load_graph_modulations
+from coralsoma.load_modulations import graph_ode_inr_predict, load_graph_modulations, load_soma_graph_modulations_each_frame
 import sys
 # sys.path.append(str(Path(__file__).parents[1]))
 sys.path.append('/pscratch/sd/g/gzhao27/INR/coral')
@@ -14,6 +14,7 @@ from coral.utils.models.load_inr import create_inr_instance, load_inr_model
 from coral.mlp import Derivative
 from coral.utils.models.scheduling import ode_scheduling
 from torchdiffeq import odeint
+from torch_geometric.data import DataLoader as GDataLoader
 
 def test_burgers():
     print('Burgers test')
@@ -41,8 +42,8 @@ def test_soma():
         data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5',
         train_num=10, 
         feature_set=[10],
-        space_factor=1,
-        time_factor=1, 
+        space_factor=4,
+        time_factor=2, 
         latent_dim=256,
     )
     feat_ori = trainset[0].feat
@@ -76,6 +77,35 @@ def test_soma():
         },
         savepath,
     )
+    
+    inr_save_name = '2024-12-31SOMA-inr_w013_lr5.6e-05_depth6_hdim155-best-train-loss'
+    inr_save_dir = '/pscratch/sd/g/gzhao27/INR/SOMA/results'
+    data_to_encode = None
+    input_dim=3
+    output_dim=1
+    inr, alpha = load_inr_model(
+            inr_save_dir,
+            inr_save_name,
+            data_to_encode,
+            input_dim=input_dim,
+            output_dim=output_dim,
+        )
+    
+    z_mean, z_std, trainset = load_soma_graph_modulations_each_frame(
+        inr_save_name=inr_save_name,
+        inr=inr,
+        trainset=trainset,
+        type='train',
+        device=device,
+        inner_steps=3,
+        alpha=alpha,
+    )
+    assert z_std > 0
+    
+    train_loader = GDataLoader(dataset=trainset, batch_size=3, shuffle=True, )
+    graph = next(iter(train_loader))
+    assert len(graph) == 3
+    print('finish')
     
 
 def test_ns():

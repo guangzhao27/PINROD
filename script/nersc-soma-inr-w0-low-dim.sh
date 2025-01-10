@@ -25,6 +25,8 @@ conda activate coral
 cd /pscratch/sd/g/gzhao27/INR/SOMA/script/
 python /pscratch/sd/g/gzhao27/INR/SOMA/coralsoma/inr.py \
     data.dataset_name=SOMA \
+    data.data_path='/global/cfs/cdirs/m4259/ecucuzzella/soma_ppe_data/ml_converted/month_1/thedataset-impliciBottomDrag.hdf5' \
+    data.mmap_dir='/pscratch/sd/g/gzhao27/INR/SOMA/results/soma_mmap_save' \
     inr.model_type=siren \
     data.space_factor=4 \
     data.time_factor=2 \
