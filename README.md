@@ -1,6 +1,6 @@
 ## Overview
 
-**SOMA-INR** is the official implementation accompanying the paper ["Generalizable Implicit Neural Representations via Parameterized Latent Dynamics for Baroclinic Ocean Forecasting."](https://arxiv.org/pdf/2503.21588?) This repository provides a deep learning framework for learning continuous neural representations of high-resolution ocean dynamics from the **Simulating Ocean Mesoscale Activity (SOMA)** dataset.
+**PINROD** is the official implementation accompanying the paper ["Generalizable Implicit Neural Representations via Parameterized Latent Dynamics for Baroclinic Ocean Forecasting."](https://arxiv.org/pdf/2503.21588?) This repository provides a deep learning framework for learning continuous neural representations of high-resolution ocean dynamics from the **Simulating Ocean Mesoscale Activity (SOMA)** dataset.
 
 The proposed framework, **PINROD** (Parameterized Implicit Neural Representation with Latent ODE Dynamics), combines implicit neural representations (INRs) with parameterized latent neural ordinary differential equations (Neural ODEs) to model the spatiotemporal evolution of baroclinic ocean simulations. Unlike conventional INR-based approaches that require learning separate latent representations for each simulation, PINROD learns a shared latent dynamics model conditioned on simulation parameters, enabling accurate forecasting across unseen physical settings.
 
